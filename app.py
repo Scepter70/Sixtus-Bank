@@ -3,14 +3,24 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
-import sqlite3
-from contextlib import contextmanager
+import os
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Iterator
+from typing import Any, List
 
 import streamlit as st
+from sqlalchemy import select, update, insert, func
+
+from db import (
+    engine,
+    metadata,
+    users,
+    wallets,
+    transactions,
+    exchange_transactions,
+    get_db as sqlalchemy_get_db,
+)
 
 
 def inject_theme() -> None:
@@ -141,7 +151,7 @@ def inject_theme() -> None:
 APP_TITLE = "Sixtus Bank"
 DB_PATH = Path(__file__).with_name("banking.db")
 DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "admin123"
+DEFAULT_ADMIN_PASSWORD = os.environ.get("SIXTUS_ADMIN_PASSWORD", "admin123")
 SUPPORTED_CURRENCIES = {
     "USD": {"name": "US Dollar", "symbol": "$", "usd_per_unit": "1"},
     "EUR": {"name": "Euro", "symbol": "€", "usd_per_unit": "1.09"},
@@ -153,97 +163,6 @@ SUPPORTED_CURRENCIES = {
     "NGN": {"name": "Nigerian Naira", "symbol": "₦", "usd_per_unit": "0.00065"},
 }
 RATE_SOURCE_LABEL = "Indicative demo rates · updated for preview"
-
-
-@contextmanager
-def get_db() -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield connection
-        connection.commit()
-    finally:
-        connection.close()
-
-
-def initialize_database() -> None:
-    with get_db() as connection:
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                full_name TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL CHECK (role IN ('customer', 'admin')),
-                account_number TEXT NOT NULL UNIQUE,
-                balance_cents INTEGER NOT NULL DEFAULT 0 CHECK (balance_cents >= 0),
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                transaction_type TEXT NOT NULL CHECK (
-                    transaction_type IN ('deposit', 'withdrawal')
-                ),
-                currency TEXT NOT NULL DEFAULT 'USD',
-                amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
-                balance_after_cents INTEGER NOT NULL CHECK (balance_after_cents >= 0),
-                note TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS wallets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                currency TEXT NOT NULL,
-                balance_cents INTEGER NOT NULL DEFAULT 0 CHECK (balance_cents >= 0),
-                UNIQUE (user_id, currency)
-            );
-
-            CREATE TABLE IF NOT EXISTS exchange_transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                from_currency TEXT NOT NULL,
-                from_amount_cents INTEGER NOT NULL CHECK (from_amount_cents > 0),
-                to_currency TEXT NOT NULL,
-                to_amount_cents INTEGER NOT NULL CHECK (to_amount_cents > 0),
-                exchange_rate TEXT NOT NULL,
-                note TEXT,
-                created_at TEXT NOT NULL
-            );
-            """
-        )
-        transaction_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(transactions)")
-        }
-        if "currency" not in transaction_columns:
-            connection.execute(
-                "ALTER TABLE transactions ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'"
-            )
-        admin = connection.execute(
-            "SELECT id FROM users WHERE username = ?",
-            (DEFAULT_ADMIN_USERNAME,),
-        ).fetchone()
-        if admin is None:
-            connection.execute(
-                """
-                INSERT INTO users (
-                    username, full_name, password_hash, role, account_number, created_at
-                ) VALUES (?, ?, ?, 'admin', ?, ?)
-                """,
-                (
-                    DEFAULT_ADMIN_USERNAME,
-                    "Sixtus Bank Administrator",
-                    hash_password(DEFAULT_ADMIN_PASSWORD),
-                    "ADMIN-000001",
-                    now_iso(),
-                ),
-            )
-        for existing_user in connection.execute("SELECT id, balance_cents FROM users"):
-            ensure_user_wallets(connection, existing_user["id"], existing_user["balance_cents"])
 
 
 def now_iso() -> str:
@@ -314,61 +233,49 @@ def convert_amount(
     return int(converted * 100), rate
 
 
-def generate_account_number(connection: sqlite3.Connection) -> str:
+def generate_account_number(connection: Any) -> str:
     while True:
         candidate = f"HB-{secrets.randbelow(900000) + 100000}"
-        exists = connection.execute(
-            "SELECT 1 FROM users WHERE account_number = ?", (candidate,)
-        ).fetchone()
+        exists = connection.execute(select(users.c.id).where(users.c.account_number == candidate)).first()
         if exists is None:
             return candidate
 
 
 def ensure_user_wallets(
-    connection: sqlite3.Connection, user_id: int, usd_balance_cents: int = 0
+    connection: Any, user_id: int, usd_balance_cents: int = 0
 ) -> None:
     for currency in SUPPORTED_CURRENCIES:
         starting_balance = usd_balance_cents if currency == "USD" else 0
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO wallets (user_id, currency, balance_cents)
-            VALUES (?, ?, ?)
-            """,
-            (user_id, currency, starting_balance),
-        )
+        exists = connection.execute(
+            select(wallets.c.id).where((wallets.c.user_id == user_id) & (wallets.c.currency == currency))
+        ).first()
+        if not exists:
+            connection.execute(
+                wallets.insert().values(user_id=user_id, currency=currency, balance_cents=starting_balance)
+            )
 
 
-def get_wallets(user_id: int) -> list[sqlite3.Row]:
-    with get_db() as connection:
-        return connection.execute(
-            """
-            SELECT currency, balance_cents
-            FROM wallets
-            WHERE user_id = ?
-            ORDER BY CASE currency
-                WHEN 'USD' THEN 0 WHEN 'EUR' THEN 1 WHEN 'GBP' THEN 2
-                WHEN 'CAD' THEN 3 WHEN 'AUD' THEN 4 WHEN 'CHF' THEN 5
-                WHEN 'JPY' THEN 6 WHEN 'NGN' THEN 7 ELSE 8 END
-            """,
-            (user_id,),
-        ).fetchall()
+def get_wallets(user_id: int) -> List[Any]:
+    with sqlalchemy_get_db() as connection:
+        rows = connection.execute(select(wallets).where(wallets.c.user_id == user_id)).fetchall()
+    # maintain preferred currency order
+    order = ["USD", "EUR", "GBP", "CAD", "AUD", "CHF", "JPY", "NGN"]
+    sorted_rows = sorted(rows, key=lambda r: order.index(r.currency) if r.currency in order else len(order))
+    return [r._asdict() for r in sorted_rows]
 
 
 def get_wallet_balance(user_id: int, currency: str) -> int:
-    with get_db() as connection:
-        wallet = connection.execute(
-            "SELECT balance_cents FROM wallets WHERE user_id = ? AND currency = ?",
-            (user_id, currency),
-        ).fetchone()
-    return wallet["balance_cents"] if wallet else 0
+    with sqlalchemy_get_db() as connection:
+        row = connection.execute(
+            select(wallets.c.balance_cents).where((wallets.c.user_id == user_id) & (wallets.c.currency == currency))
+        ).first()
+    return row.balance_cents if row else 0
 
 
-def authenticate(username: str, password: str) -> sqlite3.Row | None:
-    with get_db() as connection:
-        user = connection.execute(
-            "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username.strip(),)
-        ).fetchone()
-    if user and verify_password(password, user["password_hash"]):
+def authenticate(username: str, password: str) -> Any | None:
+    with sqlalchemy_get_db() as connection:
+        user = connection.execute(select(users).where(users.c.username == username.strip())).first()
+    if user and verify_password(password, user.password_hash):
         return user
     return None
 
@@ -391,62 +298,6 @@ def create_customer(
     if initial_currency not in SUPPORTED_CURRENCIES:
         raise ValueError("Choose a supported opening currency.")
 
-    deposit_cents = 0
-    if str(initial_deposit).strip() and Decimal(str(initial_deposit)) > 0:
-        deposit_cents = parse_amount(initial_deposit)
-
-    with get_db() as connection:
-        account_number = generate_account_number(connection)
-        try:
-            cursor = connection.execute(
-                """
-                INSERT INTO users (
-                    username, full_name, password_hash, role, account_number,
-                    balance_cents, created_at
-                ) VALUES (?, ?, ?, 'customer', ?, ?, ?)
-                """,
-                (
-                    username.strip(),
-                    full_name.strip(),
-                    hash_password(password),
-                    account_number,
-                    deposit_cents if initial_currency == "USD" else 0,
-                    now_iso(),
-                ),
-            )
-        except sqlite3.IntegrityError as error:
-            if "username" in str(error).lower():
-                raise ValueError("That username is already taken.") from error
-            raise ValueError("Could not create the account. Please try again.") from error
-
-        ensure_user_wallets(connection, cursor.lastrowid)
-        if deposit_cents:
-            connection.execute(
-                """
-                INSERT INTO transactions (
-                    user_id, transaction_type, currency, amount_cents,
-                    balance_after_cents, note, created_at
-                ) VALUES (?, 'deposit', ?, ?, ?, ?, ?)
-                """,
-                (
-                    cursor.lastrowid,
-                    initial_currency,
-                    deposit_cents,
-                    deposit_cents,
-                    "Opening deposit",
-                    now_iso(),
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE wallets
-                SET balance_cents = balance_cents + ?
-                WHERE user_id = ? AND currency = ?
-                """,
-                (deposit_cents, cursor.lastrowid, initial_currency),
-            )
-    return account_number, deposit_cents
-
 
 def update_balance(
     user_id: int,
@@ -461,20 +312,14 @@ def update_balance(
     if currency not in SUPPORTED_CURRENCIES:
         raise ValueError("Choose a supported currency.")
 
-    with get_db() as connection:
-        user = connection.execute(
-            "SELECT id, balance_cents FROM users WHERE id = ? AND role = 'customer'",
-            (user_id,),
-        ).fetchone()
+    with sqlalchemy_get_db() as connection:
+        user = connection.execute(select(users.c.id, users.c.balance_cents).where((users.c.id == user_id) & (users.c.role == 'customer'))).first()
         if user is None:
             raise ValueError("Customer account not found.")
 
-        ensure_user_wallets(connection, user_id, user["balance_cents"])
-        wallet = connection.execute(
-            "SELECT balance_cents FROM wallets WHERE user_id = ? AND currency = ?",
-            (user_id, currency),
-        ).fetchone()
-        current_balance = wallet["balance_cents"]
+        ensure_user_wallets(connection, user_id, user.balance_cents)
+        wallet = connection.execute(select(wallets.c.balance_cents).where((wallets.c.user_id == user_id) & (wallets.c.currency == currency))).first()
+        current_balance = wallet.balance_cents if wallet else 0
         new_balance = (
             current_balance + amount_cents
             if transaction_type == "deposit"
@@ -486,34 +331,22 @@ def update_balance(
             )
 
         connection.execute(
-            """
-            UPDATE wallets
-            SET balance_cents = ?
-            WHERE user_id = ? AND currency = ?
-            """,
-            (new_balance, user_id, currency),
+            update(wallets).where((wallets.c.user_id == user_id) & (wallets.c.currency == currency)).values(balance_cents=new_balance)
         )
         if currency == "USD":
             connection.execute(
-                "UPDATE users SET balance_cents = ? WHERE id = ?",
-                (new_balance, user_id),
+                update(users).where(users.c.id == user_id).values(balance_cents=new_balance)
             )
         connection.execute(
-            """
-            INSERT INTO transactions (
-                user_id, transaction_type, currency, amount_cents,
-                balance_after_cents, note, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                transaction_type,
-                currency,
-                amount_cents,
-                new_balance,
-                note.strip() or None,
-                now_iso(),
-            ),
+            transactions.insert().values(
+                user_id=user_id,
+                transaction_type=transaction_type,
+                currency=currency,
+                amount_cents=amount_cents,
+                balance_after_cents=new_balance,
+                note=note.strip() or None,
+                created_at=now_iso(),
+            )
         )
     return new_balance
 
@@ -528,160 +361,99 @@ def exchange_currency(
     amount_cents = parse_amount(amount)
     converted_cents, rate = convert_amount(amount_cents, from_currency, to_currency)
 
-    with get_db() as connection:
-        user = connection.execute(
-            "SELECT id, balance_cents FROM users WHERE id = ? AND role = 'customer'",
-            (user_id,),
-        ).fetchone()
+    with sqlalchemy_get_db() as connection:
+        user = connection.execute(select(users.c.id, users.c.balance_cents).where((users.c.id == user_id) & (users.c.role == 'customer'))).first()
         if user is None:
             raise ValueError("Customer account not found.")
 
-        ensure_user_wallets(connection, user_id, user["balance_cents"])
-        source = connection.execute(
-            """
-            SELECT balance_cents FROM wallets
-            WHERE user_id = ? AND currency = ?
-            """,
-            (user_id, from_currency),
-        ).fetchone()
-        target = connection.execute(
-            """
-            SELECT balance_cents FROM wallets
-            WHERE user_id = ? AND currency = ?
-            """,
-            (user_id, to_currency),
-        ).fetchone()
+        ensure_user_wallets(connection, user_id, user.balance_cents)
+        source = connection.execute(select(wallets.c.balance_cents).where((wallets.c.user_id == user_id) & (wallets.c.currency == from_currency))).first()
+        target = connection.execute(select(wallets.c.balance_cents).where((wallets.c.user_id == user_id) & (wallets.c.currency == to_currency))).first()
         if source is None or target is None:
             raise ValueError("Currency wallet not found.")
-        if source["balance_cents"] < amount_cents:
+        if source.balance_cents < amount_cents:
             raise ValueError(f"Not enough {from_currency} to complete this exchange.")
 
         connection.execute(
-            """
-            UPDATE wallets SET balance_cents = balance_cents - ?
-            WHERE user_id = ? AND currency = ?
-            """,
-            (amount_cents, user_id, from_currency),
+            update(wallets).where((wallets.c.user_id == user_id) & (wallets.c.currency == from_currency)).values(balance_cents=source.balance_cents - amount_cents)
         )
         connection.execute(
-            """
-            UPDATE wallets SET balance_cents = balance_cents + ?
-            WHERE user_id = ? AND currency = ?
-            """,
-            (converted_cents, user_id, to_currency),
+            update(wallets).where((wallets.c.user_id == user_id) & (wallets.c.currency == to_currency)).values(balance_cents=target.balance_cents + converted_cents)
         )
         if from_currency == "USD":
             connection.execute(
-                "UPDATE users SET balance_cents = balance_cents - ? WHERE id = ?",
-                (amount_cents, user_id),
+                update(users).where(users.c.id == user_id).values(balance_cents=users.c.balance_cents - amount_cents)
             )
         if to_currency == "USD":
             connection.execute(
-                "UPDATE users SET balance_cents = balance_cents + ? WHERE id = ?",
-                (converted_cents, user_id),
+                update(users).where(users.c.id == user_id).values(balance_cents=users.c.balance_cents + converted_cents)
             )
         connection.execute(
-            """
-            INSERT INTO exchange_transactions (
-                user_id, from_currency, from_amount_cents, to_currency,
-                to_amount_cents, exchange_rate, note, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                from_currency,
-                amount_cents,
-                to_currency,
-                converted_cents,
-                str(rate),
-                note.strip() or None,
-                now_iso(),
-            ),
+            exchange_transactions.insert().values(
+                user_id=user_id,
+                from_currency=from_currency,
+                from_amount_cents=amount_cents,
+                to_currency=to_currency,
+                to_amount_cents=converted_cents,
+                exchange_rate=str(rate),
+                note=note.strip() or None,
+                created_at=now_iso(),
+            )
         )
     return converted_cents, rate
 
 
-def get_user(user_id: int) -> sqlite3.Row | None:
-    with get_db() as connection:
-        return connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+def get_user(user_id: int) -> Any | None:
+    with sqlalchemy_get_db() as connection:
+        return connection.execute(select(users).where(users.c.id == user_id)).first()
 
 
-def get_transactions(user_id: int, limit: int = 10) -> list[sqlite3.Row]:
-    with get_db() as connection:
-        return connection.execute(
-            """
-            SELECT transaction_type, currency, amount_cents, balance_after_cents, note, created_at
-            FROM transactions
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        ).fetchall()
+def get_transactions(user_id: int, limit: int = 10) -> List[Any]:
+    with sqlalchemy_get_db() as connection:
+        rows = connection.execute(select(transactions).where(transactions.c.user_id == user_id).order_by(transactions.c.id.desc()).limit(limit)).fetchall()
+    return [r._asdict() for r in rows]
 
 
-def get_exchange_transactions(user_id: int, limit: int = 10) -> list[sqlite3.Row]:
-    with get_db() as connection:
-        return connection.execute(
-            """
-            SELECT from_currency, from_amount_cents, to_currency,
-                   to_amount_cents, exchange_rate, note, created_at
-            FROM exchange_transactions
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        ).fetchall()
+def get_exchange_transactions(user_id: int, limit: int = 10) -> List[Any]:
+    with sqlalchemy_get_db() as connection:
+        rows = connection.execute(select(exchange_transactions).where(exchange_transactions.c.user_id == user_id).order_by(exchange_transactions.c.id.desc()).limit(limit)).fetchall()
+    return [r._asdict() for r in rows]
 
 
-def get_customers() -> list[sqlite3.Row]:
-    with get_db() as connection:
-        return connection.execute(
-            """
-            SELECT id, username, full_name, account_number, balance_cents, created_at
-            FROM users
-            WHERE role = 'customer'
-            ORDER BY created_at DESC
-            """
-        ).fetchall()
+def get_customers() -> List[Any]:
+    with sqlalchemy_get_db() as connection:
+        rows = connection.execute(select(users).where(users.c.role == 'customer').order_by(users.c.created_at.desc())).fetchall()
+    return [r._asdict() for r in rows]
 
 
-def get_customer_by_account(account_number: str) -> sqlite3.Row | None:
-    with get_db() as connection:
-        return connection.execute(
-            "SELECT * FROM users WHERE account_number = ? AND role = 'customer'",
-            (account_number.strip().upper(),),
-        ).fetchone()
+def get_customer_by_account(account_number: str) -> Any | None:
+    with sqlalchemy_get_db() as connection:
+        return connection.execute(select(users).where((users.c.account_number == account_number.strip().upper()) & (users.c.role == 'customer'))).first()
 
 
 def get_total_deposits() -> int:
-    with get_db() as connection:
-        row = connection.execute(
-            "SELECT COALESCE(SUM(balance_cents), 0) AS total FROM users WHERE role = 'customer'"
-        ).fetchone()
-        return row["total"]
+    with sqlalchemy_get_db() as connection:
+        rows = connection.execute(select(users.c.balance_cents).where(users.c.role == 'customer')).fetchall()
+    return sum(r.balance_cents for r in rows)
 
 
 def get_transaction_count() -> int:
-    with get_db() as connection:
-        row = connection.execute("SELECT COUNT(*) AS total FROM transactions").fetchone()
-        return row["total"]
+    with sqlalchemy_get_db() as connection:
+        row = connection.execute(select(func.count()).select_from(transactions)).first()
+    return int(row[0])
 
 
 def get_exchange_count() -> int:
-    with get_db() as connection:
-        row = connection.execute(
-            "SELECT COUNT(*) AS total FROM exchange_transactions"
-        ).fetchone()
-        return row["total"]
+    with sqlalchemy_get_db() as connection:
+        row = connection.execute(select(func.count()).select_from(exchange_transactions)).first()
+    return int(row[0])
 
 
 def get_customer_currency_summary(user_id: int) -> str:
-    wallet_summary = []
+    wallet_summary: List[str] = []
     for wallet in get_wallets(user_id):
-        if wallet["balance_cents"] > 0:
-            wallet_summary.append(format_money(wallet["balance_cents"], wallet["currency"]))
+        if wallet['balance_cents'] > 0:
+            wallet_summary.append(format_money(wallet['balance_cents'], wallet['currency']))
     return " · ".join(wallet_summary) if wallet_summary else "No funded wallets"
 
 
@@ -704,376 +476,6 @@ def show_header() -> None:
             '<span class="version-tag">● v1.0</span></div>',
             unsafe_allow_html=True,
         )
-
-
-def show_landing() -> None:
-    st.markdown("""
-    <div class="hero">
-        <div class="hero-title">Banking that moves<br>as fast as <em>you</em> do.</div>
-        <div class="hero-sub">
-            Hold, move, and exchange money across eight currencies from one account.
-            Built for clarity, speed, and security — with every balance backed by
-            bank-grade password hashing and a full audit trail of every transaction.
-        </div>
-    </div>
-    <div class="trust-strip">
-        <div class="trust-item"><div class="trust-num">8</div><div class="trust-label">Currencies Supported</div></div>
-        <div class="trust-item"><div class="trust-num">PBKDF2</div><div class="trust-label">Password Security</div></div>
-        <div class="trust-item"><div class="trust-num">100%</div><div class="trust-label">Transaction Traceability</div></div>
-        <div class="trust-item"><div class="trust-num">24/7</div><div class="trust-label">Account Access</div></div>
-    </div>
-    <div class="feature-grid">
-        <div class="feature-card">
-            <div class="feature-icon">💱</div>
-            <h4>Multi-Currency Wallets</h4>
-            <p>Hold USD, EUR, GBP, CAD, AUD, CHF, JPY, and NGN side by side, and move between them in a single transaction.</p>
-        </div>
-        <div class="feature-card">
-            <div class="feature-icon">🔐</div>
-            <h4>Security by Design</h4>
-            <p>Passwords are never stored in plain text — every account is protected with salted PBKDF2 hashing.</p>
-        </div>
-        <div class="feature-card">
-            <div class="feature-icon">📒</div>
-            <h4>Full Transaction Ledger</h4>
-            <p>Every deposit, withdrawal, and exchange is logged with a timestamp and running balance — nothing is hidden.</p>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-def show_login() -> None:
-    st.markdown(
-        '<div class="glass-panel"><h3>Access your account</h3>'
-        '<p class="desc">Sign in to manage your money, or open a new customer account to get started.</p></div>',
-        unsafe_allow_html=True,
-    )
-
-    login_tab, create_tab = st.tabs(["Sign in", "Create account"])
-    with login_tab:
-        with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
-            if submitted:
-                user = authenticate(username, password)
-                if user is None:
-                    st.error("We couldn't sign you in with those details.")
-                else:
-                    st.session_state.user_id = user["id"]
-                    st.session_state.login_error = None
-                    st.rerun()
-
-        st.info(
-            "Demo administrator: username `admin`, password `admin123`. "
-            "Change this before using the app beyond a demo."
-        )
-
-    with create_tab:
-        with st.form("customer_registration_form", clear_on_submit=True):
-            full_name = st.text_input("Full name")
-            username = st.text_input("Choose a username")
-            password = st.text_input("Create a password", type="password")
-            submitted = st.form_submit_button(
-                "Create customer account", type="primary", use_container_width=True
-            )
-            if submitted:
-                try:
-                    account_number, deposit_cents = create_customer(
-                        username,
-                        full_name,
-                        password,
-                        "",
-                        "USD",
-                    )
-                    st.success(
-                        f"Account created. Your account number is {account_number}. "
-                        f"Sign in and make your first deposit to fund your account."
-                    )
-                    st.info("Use the username and password you just created to sign in.")
-                except (ValueError, InvalidOperation):
-                    st.error("Please check the information entered and try again.")
-
-
-def show_customer_dashboard(user: sqlite3.Row) -> None:
-    wallets = get_wallets(user["id"])
-    usd_balance = next(
-        (wallet["balance_cents"] for wallet in wallets if wallet["currency"] == "USD"), 0
-    )
-    funded_wallets = [wallet for wallet in wallets if wallet["balance_cents"] > 0]
-
-    st.markdown(
-        f'<div class="hero-eyebrow">GOOD TO SEE YOU, {user["full_name"].split()[0].upper()}</div>',
-        unsafe_allow_html=True,
-    )
-    st.caption(f"Currency account · `{user['account_number']}` · {RATE_SOURCE_LABEL}")
-
-    st.markdown(f"""
-    <div class="metric-row">
-        <div class="metric-card hero-metric">
-            <div class="metric-label">USD wallet</div>
-            <div class="metric-value">{format_money(usd_balance, "USD")}</div>
-            <div class="metric-sub">primary balance</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-label">Funded wallets</div>
-            <div class="metric-value">{len(funded_wallets)}</div>
-            <div class="metric-sub">of {len(SUPPORTED_CURRENCIES)} available</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-label">Currencies</div>
-            <div class="metric-value">{len(SUPPORTED_CURRENCIES)}</div>
-            <div class="metric-sub">supported worldwide</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    exchange_tab, deposit_tab, withdraw_tab, wallets_tab, history_tab = st.tabs(
-        ["Exchange currency", "Deposit", "Withdraw", "My wallets", "Activity"]
-    )
-    with exchange_tab:
-        st.write("Convert money between your Sixtus currency wallets.")
-        with st.form("currency_exchange_form"):
-            from_currency = st.selectbox(
-                "From currency", currency_codes(), format_func=currency_label
-            )
-            to_currency = st.selectbox(
-                "To currency", currency_codes(), index=1, format_func=currency_label
-            )
-            amount = st.text_input("Amount to exchange", placeholder="100.00")
-            note = st.text_input(
-                "Exchange note (optional)", placeholder="Travel, tuition, supplier payment"
-            )
-            rate = None
-            if from_currency != to_currency:
-                rate = get_exchange_rate(from_currency, to_currency)
-                st.caption(
-                    f"Indicative rate: 1 {from_currency} = {rate} {to_currency}. "
-                    f"Rates are for preview and should be replaced with a live provider before production trading."
-                )
-            submitted = st.form_submit_button(
-                "Exchange now", type="primary", use_container_width=True
-            )
-            if submitted:
-                try:
-                    converted_cents, applied_rate = exchange_currency(
-                        user["id"], from_currency, to_currency, amount, note
-                    )
-                    st.success(
-                        f"Exchange complete: {amount} {from_currency} → "
-                        f"{format_money(converted_cents, to_currency)} "
-                        f"({applied_rate} rate)."
-                    )
-                    st.rerun()
-                except (ValueError, InvalidOperation) as error:
-                    st.error(str(error))
-
-    with deposit_tab:
-        st.write("Add money to one of your currency wallets.")
-        with st.form("customer_deposit_form"):
-            currency = st.selectbox(
-                "Deposit currency", currency_codes(), format_func=currency_label
-            )
-            amount = st.text_input("Deposit amount", placeholder="0.00")
-            note = st.text_input("Note (optional)", placeholder="Paycheck, cash deposit, etc.")
-            submitted = st.form_submit_button("Make deposit", type="primary")
-            if submitted:
-                try:
-                    new_balance = update_balance(
-                        user["id"], "deposit", amount, note, currency
-                    )
-                    st.success(
-                        f"Deposit complete. New balance: {format_money(new_balance, currency)}"
-                    )
-                    st.rerun()
-                except (ValueError, InvalidOperation) as error:
-                    st.error(str(error))
-
-    with withdraw_tab:
-        st.write("Withdraw money from a currency wallet.")
-        with st.form("customer_withdrawal_form"):
-            currency = st.selectbox(
-                "Withdrawal currency", currency_codes(), format_func=currency_label
-            )
-            amount = st.text_input("Withdrawal amount", placeholder="0.00")
-            note = st.text_input("Note (optional)", placeholder="Travel, supplier payment, etc.")
-            submitted = st.form_submit_button("Make withdrawal", type="primary")
-            if submitted:
-                try:
-                    new_balance = update_balance(
-                        user["id"], "withdrawal", amount, note, currency
-                    )
-                    st.success(
-                        f"Withdrawal complete. New balance: {format_money(new_balance, currency)}"
-                    )
-                    st.rerun()
-                except (ValueError, InvalidOperation) as error:
-                    st.error(str(error))
-
-    with wallets_tab:
-        st.write("Your multi-currency wallet balances.")
-        for wallet in wallets:
-            wallet_col, amount_col = st.columns([3, 1])
-            with wallet_col:
-                st.write(f"**{currency_label(wallet['currency'])}**")
-                st.caption(
-                    "Available for exchange" if wallet["balance_cents"] else "No funds yet"
-                )
-            with amount_col:
-                st.metric("Balance", format_money(wallet["balance_cents"], wallet["currency"]))
-
-    with history_tab:
-        transactions = get_transactions(user["id"])
-        exchanges = get_exchange_transactions(user["id"])
-        if not transactions and not exchanges:
-            st.info("Your deposits, withdrawals, and exchanges will appear here.")
-        else:
-            for exchange in exchanges:
-                timestamp = exchange["created_at"].replace("T", " ").replace("+00:00", " UTC")
-                note = f" — {exchange['note']}" if exchange["note"] else ""
-                st.write(
-                    f"**Currency exchange** · "
-                    f"{format_money(exchange['from_amount_cents'], exchange['from_currency'])} "
-                    f"→ {format_money(exchange['to_amount_cents'], exchange['to_currency'])}  \n"
-                    f"{timestamp} · Rate: 1 {exchange['from_currency']} = "
-                    f"{exchange['exchange_rate']} {exchange['to_currency']}{note}"
-                )
-                st.divider()
-            for transaction in transactions:
-                timestamp = transaction["created_at"].replace("T", " ").replace("+00:00", " UTC")
-                sign = "+" if transaction["transaction_type"] == "deposit" else "-"
-                label = transaction["transaction_type"].title()
-                note = f" — {transaction['note']}" if transaction["note"] else ""
-                st.write(
-                    f"**{label}** · {sign}{format_money(transaction['amount_cents'], transaction['currency'])}  \n"
-                    f"{timestamp} · Balance after: "
-                    f"{format_money(transaction['balance_after_cents'], transaction['currency'])}{note}"
-                )
-                st.divider()
-
-
-def show_admin_dashboard(user: sqlite3.Row) -> None:
-    st.subheader("Administrator console")
-    st.caption("Create currency accounts, load wallets, and monitor exchange activity.")
-
-    customers = get_customers()
-    total_balance = get_total_deposits()
-    st.markdown(f"""
-    <div class="metric-row">
-        <div class="metric-card hero-metric">
-            <div class="metric-label">Customer accounts</div>
-            <div class="metric-value">{len(customers)}</div>
-            <div class="metric-sub">active customers</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-label">USD balances</div>
-            <div class="metric-value">{format_money(total_balance, "USD")}</div>
-            <div class="metric-sub">total across accounts</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-label">Currency exchanges</div>
-            <div class="metric-value">{get_exchange_count()}</div>
-            <div class="metric-sub">completed exchanges</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    create_tab, load_tab, rates_tab, accounts_tab = st.tabs(
-        ["Create customer", "Load money", "Exchange rates", "All accounts"]
-    )
-    with create_tab:
-        with st.form("admin_create_customer_form", clear_on_submit=True):
-            full_name = st.text_input("Customer full name")
-            username = st.text_input("Customer username")
-            password = st.text_input("Temporary password", type="password")
-            initial_deposit = st.text_input("Initial load (optional)", value="0.00")
-            initial_currency = st.selectbox(
-                "Initial load currency",
-                currency_codes(),
-                format_func=currency_label,
-            )
-            submitted = st.form_submit_button(
-                "Create account", type="primary", use_container_width=True
-            )
-            if submitted:
-                try:
-                    account_number, deposit_cents = create_customer(
-                        username,
-                        full_name,
-                        password,
-                        initial_deposit,
-                        initial_currency,
-                    )
-                    st.success(
-                        f"Created {account_number} for {full_name.strip()}. "
-                        f"Starting balance: {format_money(deposit_cents, initial_currency)}."
-                    )
-                except (ValueError, InvalidOperation) as error:
-                    st.error(str(error))
-
-    with load_tab:
-        if not customers:
-            st.info("Create a customer account before loading money.")
-        else:
-            with st.form("admin_load_money_form"):
-                account_options = {
-                    f"{customer['account_number']} — {customer['full_name']}": customer["account_number"]
-                    for customer in customers
-                }
-                selected_label = st.selectbox("Customer account", list(account_options))
-                currency = st.selectbox(
-                    "Wallet currency", currency_codes(), format_func=currency_label
-                )
-                amount = st.text_input("Amount to load", placeholder="0.00")
-                note = st.text_input("Load note (optional)", value="Admin account load")
-                submitted = st.form_submit_button(
-                    "Load money", type="primary", use_container_width=True
-                )
-                if submitted:
-                    target = get_customer_by_account(account_options[selected_label])
-                    if target is None:
-                        st.error("That customer account could not be found.")
-                    else:
-                        try:
-                            new_balance = update_balance(
-                                target["id"], "deposit", amount, note, currency
-                            )
-                            st.success(
-                                f"Loaded money into {target['account_number']}. "
-                                f"New balance: {format_money(new_balance, currency)}."
-                            )
-                        except (ValueError, InvalidOperation) as error:
-                            st.error(str(error))
-
-    with rates_tab:
-        st.write("Reference rates used by the exchange preview.")
-        st.caption(
-            f"{RATE_SOURCE_LABEL}. Replace these with a regulated live-rate provider "
-            "before using this for real-money trading."
-        )
-        for currency in currency_codes():
-            if currency == "USD":
-                continue
-            rate = get_exchange_rate("USD", currency)
-            left_col, right_col = st.columns([2, 1])
-            left_col.write(f"**{currency_label(currency)}**")
-            right_col.write(f"1 USD = {rate} {currency}")
-
-    with accounts_tab:
-        if not customers:
-            st.info("No customer accounts have been created yet.")
-        else:
-            for customer in customers:
-                with st.container(border=True):
-                    detail_col, balance_col = st.columns([3, 1])
-                    with detail_col:
-                        st.write(f"**{customer['full_name']}**")
-                        st.caption(
-                            f"@{customer['username']} · {customer['account_number']} · "
-                            f"{get_customer_currency_summary(customer['id'])}"
-                        )
-                    with balance_col:
-                        st.metric("USD balance", format_money(customer["balance_cents"], "USD"))
 
 
 def main() -> None:
@@ -1100,13 +502,13 @@ def main() -> None:
 
     with st.sidebar:
         st.subheader("Your session")
-        st.write(f"**{user['full_name']}**")
-        st.caption(f"{user['role'].title()} · {user['account_number']}")
+        st.write(f"**{user.full_name}**")
+        st.caption(f"{user.role.title()} · {user.account_number}")
         if st.button("Sign out", use_container_width=True):
             st.session_state.user_id = None
             st.rerun()
 
-    if user["role"] == "admin":
+    if user.role == "admin":
         show_admin_dashboard(user)
     else:
         show_customer_dashboard(user)
@@ -1114,4 +516,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

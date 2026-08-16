@@ -25,25 +25,15 @@ def inject_theme() -> None:
         }
         html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
         .stApp {
-            background: linear-gradient(155deg, var(--navy) 0%, var(--navy-2) 55%, #0C1526 100%);
-            position: relative;
-        }
-        .stApp::before {
-            content:""; position: fixed; inset:0; z-index:0; pointer-events:none;
+            background-color: var(--navy);
             background-image:
+                radial-gradient(45% 40% at 85% -5%, rgba(212,175,106,0.16), transparent 65%),
+                radial-gradient(40% 35% at 5% 100%, rgba(212,175,106,0.10), transparent 65%),
                 repeating-linear-gradient(0deg, rgba(212,175,106,0.035) 0px, transparent 1px, transparent 42px),
-                repeating-linear-gradient(90deg, rgba(212,175,106,0.035) 0px, transparent 1px, transparent 42px);
+                repeating-linear-gradient(90deg, rgba(212,175,106,0.035) 0px, transparent 1px, transparent 42px),
+                linear-gradient(155deg, var(--navy) 0%, var(--navy-2) 55%, #0C1526 100%);
+            background-attachment: fixed;
         }
-        .stApp::after {
-            content:""; position: fixed; inset:0; z-index:0; pointer-events:none;
-            background: radial-gradient(45% 40% at 85% -5%, rgba(212,175,106,0.16), transparent 65%),
-                        radial-gradient(40% 35% at 5% 100%, rgba(212,175,106,0.10), transparent 65%);
-            animation: glow-drift 20s ease-in-out infinite alternate;
-        }
-        @keyframes glow-drift {
-            0% { transform: translate(0,0); } 100% { transform: translate(-3%, 3%); }
-        }
-        section.main > div { position: relative; z-index: 1; }
         #MainMenu, footer, header[data-testid="stHeader"] { background: transparent; }
 
         .mono { font-family:'IBM Plex Mono',monospace; }
@@ -1130,3 +1120,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

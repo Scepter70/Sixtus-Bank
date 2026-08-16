@@ -774,12 +774,6 @@ def show_login() -> None:
             full_name = st.text_input("Full name")
             username = st.text_input("Choose a username")
             password = st.text_input("Create a password", type="password")
-            opening_deposit = st.text_input("Opening deposit (optional)", value="0.00")
-            opening_currency = st.selectbox(
-                "Opening currency",
-                currency_codes(),
-                format_func=currency_label,
-            )
             submitted = st.form_submit_button(
                 "Create customer account", type="primary", use_container_width=True
             )
@@ -789,12 +783,12 @@ def show_login() -> None:
                         username,
                         full_name,
                         password,
-                        opening_deposit,
-                        opening_currency,
+                        "",
+                        "USD",
                     )
                     st.success(
                         f"Account created. Your account number is {account_number}. "
-                        f"Opening balance: {format_money(deposit_cents, opening_currency)}."
+                        f"Sign in and make your first deposit to fund your account."
                     )
                     st.info("Use the username and password you just created to sign in.")
                 except (ValueError, InvalidOperation):
